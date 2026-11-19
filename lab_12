@@ -1,0 +1,210 @@
+import asyncio
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any
+
+SENTINEL = object()
+
+SAMPLE_RECORDS: list[dict[str, Any]] = [
+    {"student": "Алия", "subject": "Алгоритмы и структуры данных", "grade": 92},
+    {"student": "Дамир", "subject": "Базы данных", "grade": 58},
+    {"student": "Руслан", "subject": "Парадигмы программирования", "grade": 84},
+    {"student": "Алия", "subject": "Базы данных", "grade": 96},
+    {"student": "Руслан", "subject": "Алгоритмы и структуры данных", "grade": 76},
+    {"student": "Дамир", "subject": "Парадигмы программирования", "grade": 65},
+    {"student": "", "subject": "Базы данных", "grade": 91},
+    {"student": "Мадина", "subject": "Базы данных", "grade": 105},
+    {"student": "Арман", "subject": "", "grade": 75},
+    {"student": "Айгерим", "subject": "Математика", "grade": -5},
+]
+
+
+@dataclass
+class PipelineStats:
+    results: list[dict[str, Any]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
+
+    @property
+    def overall_average(self) -> float:
+        if not self.results:
+            return 0.0
+        return sum(item["grade"] for item in self.results) / len(self.results)
+
+    def calculate_rating(self) -> list[tuple[str, float, int]]:
+        grades_by_student: dict[str, list[float]] = defaultdict(list)
+        for item in self.results:
+            grades_by_student[item["student"]].append(float(item["grade"]))
+
+        rating = [
+            (student, sum(grades) / len(grades), len(grades))
+            for student, grades in grades_by_student.items()
+        ]
+        rating.sort(key=lambda entry: (-entry[1], entry[0]))
+        return rating
+
+
+def validate_record(record: dict[str, Any]) -> None:
+    if not isinstance(record, dict):
+        raise ValueError("Запись должна быть словарем")
+
+    student = str(record.get("student", "")).strip()
+    subject = str(record.get("subject", "")).strip()
+    grade = record.get("grade")
+
+    if not student:
+        raise ValueError("Не указано имя студента")
+    if not subject:
+        raise ValueError("Не указан предмет")
+    if isinstance(grade, bool) or not isinstance(grade, (int, float)):
+        raise ValueError("Балл должен быть числом")
+    if not 0 <= grade <= 100:
+        raise ValueError("Балл должен быть от 0 до 100")
+
+
+async def process_record(record: dict[str, Any], io_delay: float = 0.25) -> dict[str, Any]:
+    if io_delay > 0:
+        await asyncio.sleep(io_delay)
+
+    validate_record(record)
+
+    student = str(record["student"]).strip()
+    subject = str(record["subject"]).strip()
+    grade = float(record["grade"])
+    status = "зачет" if grade >= 60 else "незачет"
+
+    return {
+        "student": student,
+        "subject": subject,
+        "grade": grade,
+        "status": status,
+    }
+
+
+async def producer(
+    queue: asyncio.Queue[Any],
+    data: list[dict[str, Any]],
+    num_consumers: int,
+    produce_delay: float = 0.10,
+    verbose: bool = True,
+) -> None:
+    try:
+        for record in data:
+            if produce_delay > 0:
+                await asyncio.sleep(produce_delay)
+            await queue.put(record)
+            if verbose:
+                print(f"Получено: {record}")
+    finally:
+        for _ in range(num_consumers):
+            await queue.put(SENTINEL)
+
+
+async def consumer(
+    name: str,
+    queue: asyncio.Queue[Any],
+    stats: PipelineStats,
+    io_delay: float = 0.25,
+    process_timeout: float = 1.0,
+    verbose: bool = True,
+) -> None:
+    while True:
+        item = await queue.get()
+        try:
+            if item is SENTINEL:
+                if verbose:
+                    print(f"{name} завершен")
+                return
+
+            try:
+                async with asyncio.timeout(process_timeout):
+                    processed = await process_record(item, io_delay=io_delay)
+                stats.results.append(processed)
+                if verbose:
+                    print(f"{name} обработал {processed}")
+            except TimeoutError:
+                err_msg = f"{item}: превышен тайм-аут ({process_timeout} с)"
+                stats.errors.append(err_msg)
+            except ValueError as error:
+                err_msg = f"{item}: {error}"
+                stats.errors.append(err_msg)
+        finally:
+            queue.task_done()
+
+
+async def run_pipeline(
+    records: list[dict[str, Any]],
+    maxsize: int = 3,
+    num_consumers: int = 3,
+    produce_delay: float = 0.10,
+    io_delay: float = 0.25,
+    process_timeout: float = 1.0,
+    verbose: bool = True,
+) -> PipelineStats:
+    queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=maxsize)
+    stats = PipelineStats()
+    started = time.perf_counter()
+
+    workers = [
+        asyncio.create_task(
+            consumer(
+                name=f"worker-{i}",
+                queue=queue,
+                stats=stats,
+                io_delay=io_delay,
+                process_timeout=process_timeout,
+                verbose=verbose,
+            )
+        )
+        for i in range(1, num_consumers + 1)
+    ]
+
+    try:
+        await producer(
+            queue=queue,
+            data=records,
+            num_consumers=num_consumers,
+            produce_delay=produce_delay,
+            verbose=verbose,
+        )
+        await queue.join()
+        await asyncio.gather(*workers)
+    finally:
+        for worker in workers:
+            if not worker.done():
+                worker.cancel()
+
+    stats.elapsed_seconds = time.perf_counter() - started
+    return stats
+
+
+def print_report(stats: PipelineStats) -> None:
+    print(f"Обработано: {len(stats.results)}")
+    print(f"Ошибок: {len(stats.errors)}")
+    print(f"Средний балл: {stats.overall_average:.2f}")
+    print(f"Время: {stats.elapsed_seconds:.2f} c")
+
+    print("\nРейтинг студентов по среднему баллу:")
+    for rank, (student, avg_grade, count) in enumerate(stats.calculate_rating(), start=1):
+        print(f"{rank}. {student}: {avg_grade:.2f} (предметов: {count})")
+
+    for error in stats.errors:
+        print("Ошибка:", error)
+
+
+async def main() -> None:
+    stats = await run_pipeline(
+        records=SAMPLE_RECORDS,
+        maxsize=3,
+        num_consumers=3,
+        produce_delay=0.10,
+        io_delay=0.25,
+        process_timeout=1.0,
+        verbose=True,
+    )
+    print_report(stats)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
